@@ -2,17 +2,47 @@
 import { ref } from 'vue';
 import LivenessCheck from './components/LivenessCheck.vue';
 
-type FlowState = 'IDLE' | 'LOADING' | 'LIVENESS' | 'VERIFYING' | 'SUCCESS' | 'FAILED';
+type Mode = 'create' | 'compare' | null;
+type FlowState = 'IDLE' | 'ENTER_NAME' | 'LOADING' | 'LIVENESS' | 'VERIFYING' | 'SUCCESS' | 'FAILED' | 'RESULT';
 
+const mode = ref<Mode>(null);
 const flowState = ref<FlowState>('IDLE');
 const sessionId = ref<string | null>(null);
 const errorMsg = ref<string | null>(null);
 const confidence = ref<number | null>(null);
+const similarity = ref<number | null>(null);
+const isMatch = ref<boolean>(false);
+const userName = ref<string>('');
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5001';
 const region = import.meta.env.VITE_AWS_REGION || 'us-east-1';
 
+const selectMode = (selected: Mode) => {
+  mode.value = selected;
+  flowState.value = 'ENTER_NAME';
+  errorMsg.value = null;
+};
+
 const startLivenessFlow = async () => {
+  if (!userName.value.trim()) {
+    errorMsg.value = 'Please enter a name';
+    return;
+  }
+
+  if (mode.value === 'compare') {
+    try {
+      const checkRes = await fetch(`${backendUrl}/api/face/check-name/${encodeURIComponent(userName.value)}`);
+      const checkData = await checkRes.json();
+      if (!checkData.exists) {
+        errorMsg.value = `Name "${userName.value}" not found in database`;
+        return;
+      }
+    } catch (err: any) {
+      errorMsg.value = err.message || 'Error checking name';
+      return;
+    }
+  }
+
   flowState.value = 'LOADING';
   errorMsg.value = null;
   try {
@@ -27,23 +57,39 @@ const startLivenessFlow = async () => {
     flowState.value = 'LIVENESS';
   } catch (err: any) {
     errorMsg.value = err.message || 'Error occurred starting flow';
-    flowState.value = 'IDLE';
+    flowState.value = 'ENTER_NAME';
   }
 };
 
 const handleComplete = async (session: string) => {
   flowState.value = 'VERIFYING';
   try {
-    const response = await fetch(`${backendUrl}/api/liveness/result/${session}`);
-    if (!response.ok) {
-      throw new Error('Failed to fetch verification results');
-    }
-    const data = await response.json();
-    confidence.value = data.confidence ?? null;
-    if (data.isLive) {
+    if (mode.value === 'create') {
+      const response = await fetch(`${backendUrl}/api/face/create-master`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: userName.value, sessionId: session }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to create master');
+      }
+      confidence.value = data.confidence ?? null;
       flowState.value = 'SUCCESS';
-    } else {
-      flowState.value = 'FAILED';
+    } else if (mode.value === 'compare') {
+      const response = await fetch(`${backendUrl}/api/face/compare`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: userName.value, sessionId: session }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to compare faces');
+      }
+      confidence.value = data.confidence ?? null;
+      similarity.value = data.similarity ?? null;
+      isMatch.value = data.match;
+      flowState.value = 'RESULT';
     }
   } catch (err: any) {
     errorMsg.value = err.message || 'Error occurred during verification';
@@ -61,6 +107,16 @@ const resetFlow = () => {
   flowState.value = 'IDLE';
   sessionId.value = null;
   confidence.value = null;
+  similarity.value = null;
+  isMatch.value = false;
+  errorMsg.value = null;
+  userName.value = '';
+  mode.value = null;
+};
+
+const backToName = () => {
+  flowState.value = 'ENTER_NAME';
+  sessionId.value = null;
   errorMsg.value = null;
 };
 </script>
@@ -72,9 +128,9 @@ const resetFlow = () => {
         <svg class="shield-icon" viewBox="0 0 24 24" width="36" height="36" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
         </svg>
-        <h1>Face Liveness Vue Wrapper</h1>
+        <h1>Face Liveness & Compare</h1>
       </div>
-      <p class="subtitle">React-in-Vue Bridge validation for AWS Rekognition Face Liveness</p>
+      <p class="subtitle">AWS Rekognition Face Liveness with Master Photo & Face Comparison</p>
     </header>
 
     <main class="main-card">
@@ -83,16 +139,49 @@ const resetFlow = () => {
           <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
           <circle cx="12" cy="13" r="4"></circle>
         </svg>
-        <h2>Verify Identity</h2>
+        <h2>Select Action</h2>
         <p class="instructions">
-          Prepare your camera in a well-lit space. You will be asked to align your face inside the oval frame.
+          Create a master photo for a new user, or compare a face against an existing master.
         </p>
         <div v-if="errorMsg" class="error-banner">
           {{ errorMsg }}
         </div>
-        <button class="btn btn-primary" @click="startLivenessFlow">
-          Start Liveness Check
-        </button>
+        <div class="btn-group">
+          <button class="btn btn-primary" @click="selectMode('create')">
+            Create Master Photo
+          </button>
+          <button class="btn btn-secondary" @click="selectMode('compare')">
+            Check Compare Photo
+          </button>
+        </div>
+      </div>
+
+      <div v-if="flowState === 'ENTER_NAME'" class="state-content">
+        <h2>{{ mode === 'create' ? 'Create Master' : 'Compare Face' }}</h2>
+        <p class="instructions">
+          {{ mode === 'create'
+            ? 'Enter the name for the new master photo, then start the liveness check.'
+            : 'Enter the name associated with the master photo in the database.'
+          }}
+        </p>
+        <div v-if="errorMsg" class="error-banner">
+          {{ errorMsg }}
+        </div>
+        <input
+          v-model="userName"
+          type="text"
+          class="text-input"
+          placeholder="Enter name"
+          @keyup.enter="startLivenessFlow"
+        />
+        <div class="btn-group">
+          <button class="btn btn-secondary" @click="resetFlow">
+            Back
+          </button>
+          <button class="btn btn-primary" @click="startLivenessFlow">
+            Start Liveness Check
+          </button>
+        </div>
       </div>
 
       <div v-if="flowState === 'LOADING'" class="state-content">
@@ -115,8 +204,8 @@ const resetFlow = () => {
         <svg class="spinner" viewBox="0 0 24 24" width="48" height="48" stroke="currentColor" stroke-width="2.5" fill="none">
           <circle cx="12" cy="12" r="10" stroke-dasharray="40 20" stroke-linecap="round"></circle>
         </svg>
-        <h2>Analyzing Session</h2>
-        <p class="instructions">Fetching verification result from backend...</p>
+        <h2>{{ mode === 'create' ? 'Saving Master Photo' : 'Comparing Faces' }}</h2>
+        <p class="instructions">Processing...</p>
       </div>
 
       <div v-if="flowState === 'SUCCESS'" class="state-content">
@@ -124,13 +213,41 @@ const resetFlow = () => {
           <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
           <polyline points="22 4 12 14.01 9 11.01"></polyline>
         </svg>
-        <h2>Liveness Verified</h2>
-        <p class="instructions">Successfully passed biometric check.</p>
+        <h2>Master Photo Created</h2>
+        <p class="instructions">Successfully saved master photo for "{{ userName }}".</p>
         <div v-if="confidence !== null" class="result-metric">
-          Confidence: <span class="score">{{ confidence.toFixed(1) }}%</span>
+          Liveness Confidence: <span class="score">{{ confidence.toFixed(1) }}%</span>
         </div>
         <button class="btn btn-secondary" @click="resetFlow">
-          Verify Again
+          Done
+        </button>
+      </div>
+
+      <div v-if="flowState === 'RESULT'" class="state-content">
+        <svg v-if="isMatch" class="main-icon success-icon" viewBox="0 0 24 24" width="64" height="64" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+          <polyline points="22 4 12 14.01 9 11.01"></polyline>
+        </svg>
+        <svg v-else class="main-icon error-icon" viewBox="0 0 24 24" width="64" height="64" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"></circle>
+          <line x1="15" y1="9" x2="9" y2="15"></line>
+          <line x1="9" y1="9" x2="15" y2="15"></line>
+        </svg>
+        <h2>{{ isMatch ? 'Face Match' : 'No Match' }}</h2>
+        <p class="instructions">
+          {{ isMatch
+            ? `Face matches master photo for "${userName}".`
+            : `Face does NOT match master photo for "${userName}".`
+          }}
+        </p>
+        <div v-if="similarity !== null" class="result-metric">
+          Similarity: <span class="score" :class="{ failed: !isMatch }">{{ similarity.toFixed(1) }}%</span>
+        </div>
+        <div v-if="confidence !== null" class="result-metric">
+          Liveness Confidence: <span class="score">{{ confidence.toFixed(1) }}%</span>
+        </div>
+        <button class="btn btn-secondary" @click="resetFlow">
+          Done
         </button>
       </div>
 
@@ -145,9 +262,14 @@ const resetFlow = () => {
         <div v-if="confidence !== null" class="result-metric">
           Confidence: <span class="score failed">{{ confidence.toFixed(1) }}%</span>
         </div>
-        <button class="btn btn-primary" @click="resetFlow">
-          Retry Check
-        </button>
+        <div class="btn-group">
+          <button class="btn btn-secondary" @click="resetFlow">
+            Home
+          </button>
+          <button class="btn btn-primary" @click="backToName">
+            Retry
+          </button>
+        </div>
       </div>
     </main>
   </div>
@@ -274,6 +396,33 @@ h2 {
   box-sizing: border-box;
 }
 
+.text-input {
+  width: 100%;
+  max-width: 320px;
+  padding: 0.75rem 1rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(15, 17, 26, 0.8);
+  color: #f1f3f9;
+  font-size: 1rem;
+  font-family: inherit;
+  margin-bottom: 2rem;
+  box-sizing: border-box;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+
+.text-input:focus {
+  border-color: #6366f1;
+}
+
+.btn-group {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
 .btn {
   font-family: inherit;
   font-weight: 600;
@@ -322,7 +471,7 @@ h2 {
   border: 1px solid rgba(255, 255, 255, 0.05);
   border-radius: 16px;
   padding: 1rem 2rem;
-  margin-bottom: 2rem;
+  margin-bottom: 1rem;
   font-size: 1.1rem;
   color: #cbd5e1;
 }
